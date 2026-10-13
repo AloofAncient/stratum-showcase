@@ -11,8 +11,8 @@ An end-to-end **medallion data pipeline** (raw → bronze → silver → gold) t
 ## Highlights
 
 - **Medallion architecture, fully serverless** — EventBridge-scheduled Step Functions orchestrate a Lambda ingestor and three sequential Glue ETL jobs; Parquet on S3; DynamoDB execution tracking; SNS notifications at every stage.
-- **Aggressive cost engineering** — no ALB, no NAT Gateway, no RDS instances. CloudFront fronts a Fargate Spot task whose public IP is kept current in Route53 by an event-driven Lambda. Services auto-stop evenings and weekends. A **billing circuit breaker** checks Cost Explorer daily and, on budget breach, disables all schedules and drains ECS to zero — with a one-action restore.
-- **One platform API, simple auth** — a FastAPI gateway serves the data API, ops actions and the AI layer. Google SSO via Cognito, access tokens only, two platform roles, **deny by default** (a CI test fails any route without a declared role). OpenAPI is generated from code.
+- **Aggressive cost engineering** — no ALB, no NAT Gateway, no RDS instances. CloudFront fronts a Fargate Spot task whose public IP is kept current in Route53 by an event-driven Lambda. Services auto-stop evenings and weekends. A **billing circuit breaker** checks Cost Explorer daily and, on budget breach, disables all schedules and drains ECS to zero — with a one-action restore. An admin can stop, start, restore or kill the platform from the ops UI through a small **control plane that lives outside the gateway**, so it still works when the gateway is stopped.
+- **One platform API, simple auth** — a FastAPI gateway serves the data API and the AI layer. Google SSO via Cognito, access tokens only, two platform roles, **deny by default** (a CI test fails any route without a declared role). OpenAPI is generated from code.
 - **AI layer on Bedrock** — Claude Sonnet 4.6 behind one client that records every call (tokens, cache hits, latency, cost) in Aurora DSQL, with per-user and global daily spend limits. **Ops Chat** answers questions about the platform through 19 read-only tools; it can never change anything.
 - **Change pipeline with a human at both ends** — a change request is approved by an admin, the repo is snapshotted to S3, a planner/author pair generates the edits, a CodeBuild sandbox runs the repo's own checks with up to three LLM fix rounds, and a pull request is raised. A person reviews and merges; the pipeline only writes `change/*` branches. Resumable from any step.
 - **100% infrastructure as code** — Terraform via HCP Terraform, with branch → environment CI/CD mapping (`develop → DEV`, `release → UAT`, `master → PROD`). No hardcoded resource names; everything resolves through SSM Parameter Store at deploy time.
@@ -52,7 +52,10 @@ flowchart LR
         BC --> CE[Cost Explorer check]
         BC --> STOPGO[ECS stop/start<br/>evenings & weekends]
         CE -->|budget breach| KILL[Disable schedules<br/>drain ECS to zero]
+        OPS[Ops control API<br/>HTTP API + Lambda<br/>works while the gateway is down] --> BC
     end
+
+    UI -->|admin stop · start · kill| OPS
 ```
 
 Full design detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Interactive version: [architecture map](https://aloofancient.github.io/stratum-showcase/stratum-architecture.html)
@@ -93,9 +96,9 @@ A Next.js UI (chat, status, approvals, activity, admin usage, change pipeline) s
 ![Ops Chat](assets/stratum-ui-ops-chat-v2.png)
 ![Status tab](assets/stratum-ui-ops-status-v2.png)
 
-Admins see every AI call, with tokens, cost and per-user spend against the daily limits:
+Admins see every AI call, with tokens, cost and per-user spend against the daily limits, and run the platform operations (ETL run, start, stop, restore, kill) behind a confirmation dialog; stop and kill need the word typed:
 
-![AI usage and audit](assets/stratum-ops-ui-admin-v2.png)
+![Admin: AI usage, audit and operations](assets/stratum-ops-ui-admin-v2.png)
 
 ### Change pipeline
 
@@ -111,12 +114,12 @@ The result is an ordinary pull request with the build evidence in its descriptio
 
 ### Billing circuit breaker
 
-One Step Functions router handles all cost operations — the `action` field (or its absence) picks the branch: daily Cost Explorer check, scheduled stop/start, or restore:
+One Step Functions router handles all cost operations — the `action` field (or its absence) picks the branch: daily Cost Explorer check, scheduled stop/start, restore, or the emergency kill:
 
 ![Billing control - check billing branch](assets/billing-guard-step-function-check-billing.png)
 ![Billing control - restore branch](assets/billing-guard-step-function-restore.png)
 
-On budget breach it alerts, disables every scheduled rule except its own, and drains ECS to zero; restore is a single state-machine execution:
+On budget breach it alerts, disables every scheduled rule except its own, and drains ECS to zero; restore is a single state-machine execution. Admins start these runs from the ops UI through an HTTP API and one Lambda that sit outside the gateway: a stop takes the gateway down, so the control plane cannot live inside it. When the gateway is down the UI shows *Platform is asleep* with a *Wake up* button; a repeat of an action that is still running is refused:
 
 ![Emergency shutdown alert](assets/billing-emergency-shutdown-services-alert.png)
 ![Services restored alert](assets/billing-restore-services-alert.png)
@@ -133,11 +136,12 @@ On budget breach it alerts, disables every scheduled rule except its own, and dr
 
 1. **No ALB (~$16/mo saved):** CloudFront → Route53 → Fargate task public IP, with an ECS-task-state-change EventBridge rule triggering a Lambda that re-points the A record whenever Spot replaces the task.
 2. **The data API reads S3 gold directly — no database in the serving path.** Parquet + date-partitioned prefixes are enough; the gateway resolves the latest partition at query time.
-3. **Cost control as a state machine:** one Step Functions router handles scheduled stop/start, daily budget checks, and manual restore — the payload's `action` field (or its absence) picks the branch.
+3. **Cost control as a state machine:** one Step Functions router handles scheduled stop/start, daily budget checks, and manual restore or kill — the payload's `action` field (or its absence) picks the branch.
 4. **Serverless SQL only where SQL is needed:** audit, chat and job data go to Aurora DSQL (idle cost $0, free tier); the ETL side stays on S3 and DynamoDB.
 5. **The chat can read, never write:** Ops Chat tools are read-only by construction; anything that changes infrastructure is an explicit admin endpoint a person triggers.
 6. **AI changes ship as PRs, never as merges:** generated code passes path and output guards, a sandbox running the repo's own checks, and a human review before it lands.
 7. **Resume by re-running:** every pipeline step is safe to repeat, so recovery after a deploy or crash is just running the action again.
+8. **Keep the control plane out of the thing it controls:** the stop/start/restore/kill endpoint is a pay-per-request HTTP API plus one Lambda with its own least-privilege role, not a route in the gateway it shuts down — so waking the platform never depends on the platform being awake.
 
 ---
 
