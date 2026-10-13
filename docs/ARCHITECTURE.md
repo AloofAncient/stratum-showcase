@@ -9,7 +9,8 @@ STRATUM collects financial market data weekly, processes it through a medallion 
 | Component | What it is |
 |-----------|-----------|
 | Data pipeline | EventBridge → Step Functions → Lambda ingestion + three Glue jobs, Parquet on S3 |
-| Gateway | One FastAPI service on ECS Fargate Spot: data API, ops actions, access management, Ops Chat, change pipeline |
+| Gateway | One FastAPI service on ECS Fargate Spot: data API, ETL trigger and budget view, access management, Ops Chat, change pipeline |
+| Ops control API | API Gateway HTTP API + one Lambda that starts the billing-control state machine; separate from the gateway so it works while the gateway is stopped |
 | Ops UI | Next.js on Amplify, Google SSO via Cognito, calls the gateway with the signed-in user's token |
 | AI layer | Claude Sonnet 4.6 on Amazon Bedrock, usage and cost recorded for every call |
 | Data store | DynamoDB (pipeline runs, access requests) and serverless Aurora DSQL (AI audit, chat, jobs) |
@@ -29,12 +30,12 @@ The **gold layer is the serving layer** — the gateway reads it directly from S
 
 The gateway is a FastAPI service on ECS Fargate Spot in public subnets. There is no load balancer: CloudFront points at a Route53 A record holding the current task's public IP. When Spot replaces the task, an EventBridge rule on ECS Task State Change events triggers a Lambda that reads the new ENI's public IP and upserts the A record. The Lambda retries internally because the IP isn't always assigned the instant ECS reports RUNNING.
 
-The API is OpenAPI-documented (Swagger UI) and grouped by purpose: data and pipeline reads, explicit admin-only **ops actions** (run the ETL pipeline, stop/start/restore ECS services), access management, and the AI routes. The **ops UI** (Amplify) gives the same platform a front end: chat, status and budget, approvals and users, an admin view of AI usage, and the Change Pipeline tab.
+The API is OpenAPI-documented (Swagger UI) and grouped by purpose: data and pipeline reads, the admin-only ETL trigger and budget view, access management, and the AI routes. Stop/start/restore/kill are **not** gateway routes: they run through the separate ops control API (see Cost control). The **ops UI** (Amplify) gives the same platform a front end: chat, status and budget, approvals and users, an admin view of AI usage, and the Change Pipeline tab.
 
 ## Auth
 
 - **Humans only.** Google SSO through Cognito; no machine-to-API credentials.
-- Every request carries a Cognito **access token**. One FastAPI dependency verifies the signature (cached JWKS), issuer, expiry, token type and client.
+- Every request carries a Cognito **access token**. One FastAPI dependency verifies the signature (cached JWKS), issuer, expiry, token type and client. The ops control API validates the same token with an HTTP API JWT authorizer, and its Lambda additionally requires the `stratum-admin` role.
 - **Two platform roles** — `stratum-user` and `stratum-admin` — shared by every app. Authorization is declared per router and is **deny by default**; a CI test walks every route and fails if one has no role or public marker.
 - New users request access; an admin approves or rejects it in the ops UI, which adds the user to a role group. The requester is notified by email (SES).
 
@@ -44,7 +45,9 @@ A single **billing-control state machine** routes on the `action` field of its i
 
 - Scheduled STOP/START payloads implement nightly and weekend shutdown of ECS services (desired count → 0, back to 1 on weekday mornings).
 - A daily run with no payload routes to the default branch: a **billing-guard Lambda** compares month-to-date Cost Explorer spend against a threshold. On breach it alerts via SNS, disables all of the project's scheduled EventBridge rules (except its own, so monitoring continues), and drains all ECS services to zero.
-- A manual RESTORE action re-enables rules and restores services.
+- A manual RESTORE action re-enables rules and restores services; a manual KILL is the emergency shutdown that skips the cost check.
+
+**Ops control API.** Admins run STOP, START, RESTORE and KILL from the ops UI. The request goes to an API Gateway HTTP API (pay per request, no fixed cost) with a Cognito JWT authorizer and one Lambda that checks the admin role, accepts only those four actions, refuses a repeat of an action that is still running, and starts the billing-control execution. It has its own IAM role that can only start and list that state machine's executions, and it is throttled. It sits outside the gateway on purpose: STOP takes the gateway down, so a control plane inside it could not start it again. When the gateway health check fails the ops UI shows *Platform is asleep* with a *Wake up* button for admins (START, about one to two minutes).
 
 ECS desired counts are runtime state: Terraform ignores changes to them so a plan never fights the scheduler. AI spend is capped too: a per-user and a global daily limit on Ops Chat, checked before every turn and enforced from recorded call costs.
 
@@ -82,5 +85,6 @@ Terraform modules are layered (storage, catalog/ETL, functions, containers, even
 - **Fargate Spot + Route53 is a viable ALB replacement** for low-traffic services, but only with event-driven IP reconciliation and generous Lambda timeouts (IP propagation lags task RUNNING status).
 - **Poll, don't stream, behind a buffering edge.** Amplify and CloudFront hold streamed responses, so long AI work runs in the background with a 202 and the UI polls.
 - **Make every side effect safe to repeat.** Resume is just "run the step again", which only works if artifacts overwrite, PRs are reused and counters change in the same transaction as the row that justifies them.
+- **Keep the control plane out of the thing it controls.** The stop/start endpoint is an HTTP API plus one Lambda, not a route in the gateway it stops, so starting the platform never depends on the platform being up.
 - **Deny by default, and test it structurally.** A route-coverage test fails the build when any endpoint lacks a declared role — cheaper than reviewing every route by eye.
 - **Treat repo content and job text as data, not instructions.** Marker-delimited prompts, a planner that never sees file contents, and path and output guards limit what an injected line can do.
